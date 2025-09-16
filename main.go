@@ -1,9 +1,22 @@
 package main
 
-// gotestfmt is a small utility for formatting the JSON output from
-// `go test -json`. It aggregates test events, groups them by
-// package and test name, and then renders a better summary to
-// standard output.
+// gotestfmt formats the JSON stream from `go test -json` into a readable,
+// deterministic summary suitable for both local usage and CI logs.
+// It aggregates events by package/test, renders per-package results (either
+// detailed lines or condensed summaries), shows failures and build errors,
+// lists the slowest tests, and exits non-zero if any failures or build errors
+// were encountered.
+//
+// Usage:
+//   go test -json ./... | gotestfmt [flags]
+//
+// Flags:
+//   --summary     condense successful packages to a 1-line summary
+//   --no-colors   disable ANSI colors
+//   --top N       show the N slowest tests (default 10)
+//   --show-logs   include generic logs for failing tests in details
+//   --github      emit GitHub Actions ::error annotations
+
 import (
 	"bufio"
 	"encoding/json"
@@ -13,54 +26,23 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 )
 
-// Event mirrors the structure of objects emitted by `go test -json`.
-// Ref https://pkg.go.dev/cmd/test2json
-type Event struct {
-	Time    time.Time `json:"Time"`
-	Action  string    `json:"Action"`
-	Package string    `json:"Package"`
-	Test    string    `json:"Test,omitempty"`
-	Elapsed float64   `json:"Elapsed,omitempty"`
-	Output  string    `json:"Output,omitempty"`
-	Error   string    `json:"Error,omitempty"`
-}
-
-// testResult tracks the aggregated state for a single test. We record the
-// final status (pass, fail, skip), execution time and any output lines.
-// Output lines are kept verbatim; trimming is deferred to rendering time.
-type testResult struct {
-	Package string
-	Name    string
-	Action  string
-	Elapsed float64
-	Output  []string
-}
-
 const (
-	// Actions as emitted by the go tool. These constants ensure we
-	// compare against a single canonical string rather than sprinkling
-	// magic values throughout the code.
+	// Actions emitted by `go test -json` / test2json
 	actRun       = "run"
 	actPass      = "pass"
 	actFail      = "fail"
 	actSkip      = "skip"
 	actError     = "error"
-	actBuildFail = "build-fail"
-	actBuildOut  = "build-output"
+	actOutput    = "output"       // stdout/stderr line for a package or a test
+	actBuildFail = "build-fail"   // non-standard: build failure sentinel
+	actBuildOut  = "build-output" // non-standard: build log/output line
 )
-
-// colors is a simple helper to optionally apply ANSI colour codes when
-// printing.  When colours are disabled, the `style` method simply
-// returns the original string. The zero value for colors (enabled
-// false) is safe for use.
-type colors struct {
-	enabled bool
-}
 
 const (
 	cReset  = "\033[0m"
@@ -71,12 +53,50 @@ const (
 	cGray   = "\033[90m"
 )
 
-// newColors returns a Colors instance.
+// fileLineRe matches strings of the form "<file.go>:<line>: <message>"
+var fileLineRe = regexp.MustCompile(`^(.+\.go):(\d+):\s*(.*)$`)
+
+// ansiRe matches ANSI escape sequences used for colouring. We use it
+// when computing visible string lengths for alignment. Without stripping
+// ANSI sequences the padding will be off because the escapes count
+// towards the string length.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+type Event struct {
+	Time    time.Time `json:"Time"`
+	Action  string    `json:"Action"`
+	Package string    `json:"Package"`
+	Test    string    `json:"Test,omitempty"`
+	Elapsed float64   `json:"Elapsed,omitempty"`
+	Output  string    `json:"Output,omitempty"`
+	Error   string    `json:"Error,omitempty"`
+}
+
+// testResult tracks the aggregated state for a single test
+type testResult struct {
+	Package string
+	Name    string
+	Action  string   // pass|fail|skip (final)
+	Elapsed float64  // seconds
+	Output  []string // collected lines (policy depends on flags)
+}
+
+// Aggregator collects events and produces test/build error summaries.
+type Aggregator struct {
+	results       map[string]*testResult   // key = pkg + "/" + test
+	testsByPkg    map[string][]*testResult // output order per package
+	pkgErrors     map[string][]string      // build/runtime errors per package
+	keepAllOutput bool                     // keep all output for passing tests if true
+}
+
+type colors struct {
+	enabled bool
+}
+
 func newColors(enabled bool) colors { return colors{enabled: enabled} }
 
 // style wraps the given string in any number of ANSI codes followed by a
-// reset. When colour output is disabled the string is returned
-// unchanged. An explicit reset is appended to ensure state does not
+// reset. An explicit reset is appended to ensure state does not
 // bleed into subsequent print calls.
 func (c colors) style(s string, codes ...string) string {
 	if !c.enabled {
@@ -112,19 +132,36 @@ func (c colors) status(action string) string {
 	}
 }
 
-// Aggregator collects test events and produces aggregated results on
-// demand. It keeps insertion order per package to make the output
-// deterministic across runs.
-type Aggregator struct {
-	results       map[string]*testResult   // key: pkg/test
-	testsByPkg    map[string][]*testResult // pkg -> []*TestResult (in insertion order)
-	pkgErrors     map[string][]string      // package build or runtime errors
-	keepAllOutput bool                     // include INFO/WARN etc when showing fail details
+func stripANSI(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
 }
 
-// NewAggregator creates an empty aggregator. When keepAllOutput is
-// true the collector preserves all output lines, even for tests that
-// eventually pass; otherwise only output for failing tests is kept.
+// visibleLen returns the display width as rune-count (ANSI stripped).
+// (We do not attempt full grapheme width calculations here.)
+func visibleLen(s string) int {
+	return utf8.RuneCountInString(stripANSI(s))
+}
+
+func pad(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.Repeat(" ", n)
+}
+
+// formatSecs formats a floating point number of seconds to three decimal
+// places.
+func formatSecs(s float64) string {
+	return fmt.Sprintf("%.3fs", s)
+}
+
+// printHeader prints a section header in bold. The caller can include
+// colour codes in the title string (for example via Colors.red) and
+// they will be preserved because we don't further style the string.
+func printHeader(c colors, title string) {
+	fmt.Println(c.bold("=== " + title + " ==="))
+}
+
 func NewAggregator(keepAllOutput bool) *Aggregator {
 	return &Aggregator{
 		results:       make(map[string]*testResult),
@@ -154,7 +191,7 @@ func (a *Aggregator) Add(ev Event) {
 		return
 	}
 
-	// Ignore non‑test events (such as output at the package level).
+	// Ignore non-test events (package-level output etc.)
 	if ev.Test == "" {
 		return
 	}
@@ -162,26 +199,31 @@ func (a *Aggregator) Add(ev Event) {
 	key := ev.Package + "/" + ev.Test
 	switch ev.Action {
 	case actRun:
-		// Starting a new test resets any previous state. This can
-		// legitimately happen if multiple runs are interleaved (for
-		// example via -run flags), though it is uncommon.
 		tr := &testResult{Package: ev.Package, Name: ev.Test}
 		a.results[key] = tr
 		a.testsByPkg[ev.Package] = append(a.testsByPkg[ev.Package], tr)
 
-	case "output":
-		// Keep output if we haven't decided outcome yet, or if we are
-		// keeping logs for passing tests. Output can include arbitrary
-		// newlines; preserve the original line breaks by splitting on
-		// newline boundaries when ingesting from the decoder.
+	case actOutput:
+		// Append per-line, preserving order; store only while undecided
+		// or for failures; keep for passing tests only when keepAllOutput is true.
 		if tr, ok := a.results[key]; ok && (a.keepAllOutput || tr.Action == "" || tr.Action == actFail) {
-			tr.Output = append(tr.Output, ev.Output)
+			// Split on newlines; keep non-empty trimmed lines.
+			for ln := range strings.SplitSeq(ev.Output, "\n") {
+				if ln == "" {
+					continue
+				}
+				tr.Output = append(tr.Output, ln)
+			}
 		}
 
 	case actPass, actFail, actSkip:
 		if tr, ok := a.results[key]; ok {
 			tr.Action = ev.Action
 			tr.Elapsed = ev.Elapsed
+			// Memory hygiene: if pass and we are not keeping all output, drop buffered lines.
+			if ev.Action == actPass && !a.keepAllOutput {
+				tr.Output = nil
+			}
 		}
 	}
 }
@@ -230,103 +272,90 @@ func (a *Aggregator) Timed() []*testResult {
 	return out
 }
 
-// fileLineRe matches strings of the form "<file.go>:<line>: <message>". It is
-// used to detect file/line pairs in test output so we can render them more
-// succinctly or transform them into GitHub annotations. The three capture
-// groups correspond to the file name, line number and message body.
-// Ref: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands
-var fileLineRe = regexp.MustCompile(`^(.+\.go):(\d+):\s*(.*)$`)
-
-// formatSecs formats a floating point number of seconds to three decimal
-// places. We deliberately preserve the legacy behaviour of always
-// printing exactly three decimal places to make output consistent with
-// earlier versions of this tool.
-func formatSecs(s float64) string {
-	return fmt.Sprintf("%.3fs", s)
-}
-
-// printHeader prints a section header in bold. The caller can include
-// colour codes in the title string (for example via Colors.red) and
-// they will be preserved because we don't further style the string.
-func printHeader(c colors, title string) {
-	fmt.Println(c.bold("=== " + title + " ==="))
-}
-
-// printPackageBlock prints a table of tests within a package. When
-// condense is true and there are no failing tests in the package, a
-// single summary line is emitted instead of printing each test. It
-// returns the total number of tests along with counts of passed,
-// failed and skipped tests.
-// Note that on early return from the condensed path we must
-// explicitly assign to the named return
-// variables so that callers receive accurate statistics.
-func printPackageBlock(c colors, pkg string, tests []*testResult, condense bool, tw *tabwriter.Writer) (tot, pass, fail, skip int) {
-	anyFailed, anyPassed := false, false
-	pkgPassed, pkgSkipped := 0, 0
-
-	// Sort test names for determinism
+// printPackageBlock renders tests for a package.
+// If condense==true and there are no failures, it prints one summary line.
+// Returns totals: tot, pass, fail, skip.
+func printPackageBlock(c colors, pkg string, tests []*testResult, condense bool) (tot, pass, fail, skip int) {
+	// Deterministic order
 	sort.Slice(tests, func(i, j int) bool { return tests[i].Name < tests[j].Name })
 
+	// First pass: counts & failure detection
+	anyFailed := false
 	for _, r := range tests {
 		tot++
 		switch r.Action {
 		case actPass:
 			pass++
-			anyPassed = true
-			pkgPassed++
 		case actFail:
 			fail++
 			anyFailed = true
 		case actSkip:
 			skip++
-			pkgSkipped++
 		}
 	}
 
-	if condense && !anyFailed && anyPassed {
-		// When condensing successful packages we output a single summary
-		// line. Assign to the named returns to ensure the caller
-		// receives the correct counters.
-		if pkgSkipped > 0 {
-			fmt.Fprintf(tw, "%s\t%s%d tests passed%s\t(%d skipped)\n",
-				c.bold(pkg), c.green(""), pkgPassed, "", pkgSkipped)
+	// Condensed line for all-pass packages when requested
+	if condense && !anyFailed && pass > 0 {
+		if skip > 0 {
+			fmt.Printf("%s  %s passed (%s skipped)\n",
+				c.bold(pkg),
+				c.green(strconv.Itoa(pass)),
+				c.yellow(strconv.Itoa(skip)),
+			)
 		} else {
-			fmt.Fprintf(tw, "%s\t%s%d tests passed%s\n",
-				c.bold(pkg), c.green(""), pkgPassed, "")
+			fmt.Printf("%s  %s passed\n",
+				c.bold(pkg),
+				c.green(strconv.Itoa(pass)),
+			)
 		}
-		_ = tw.Flush()
-		// Override totals for condensed branch. The variables tot,
-		// pass, fail and skip are named return values and thus in
-		// scope here.
-		tot = len(tests)
-		pass = pkgPassed
-		fail = 0
-		skip = pkgSkipped
 		return
 	}
 
-	// Non‑condensed output prints each test on its own line. Elapsed
-	// times are shown in parentheses when available.
+	// Detailed table: second pass computes widths across ALL tests.
+	statusWidth, nameWidth, timeWidth := 0, 0, 0
+	for _, r := range tests {
+		sw := visibleLen(c.status(r.Action))
+		if sw > statusWidth {
+			statusWidth = sw
+		}
+		if ln := utf8.RuneCountInString(r.Name); ln > nameWidth {
+			nameWidth = ln
+		}
+		if r.Elapsed > 0 {
+			tStr := "(" + formatSecs(r.Elapsed) + ")"
+			if lt := utf8.RuneCountInString(tStr); lt > timeWidth {
+				timeWidth = lt
+			}
+		}
+	}
+
 	fmt.Println(c.bold(pkg))
 	for _, r := range tests {
-		timeStr := ""
+		statusStr := c.status(r.Action)
+		fmt.Print("  ")
+		fmt.Print(statusStr)
+		fmt.Print(pad(statusWidth - visibleLen(statusStr)))
+		fmt.Print("  ")
+
+		// Name
+		nameRunes := utf8.RuneCountInString(r.Name)
+		fmt.Print(r.Name)
+		fmt.Print(pad(nameWidth - nameRunes))
+
+		// Time
 		if r.Elapsed > 0 {
-			timeStr = c.gray(" (" + formatSecs(r.Elapsed) + ")")
+			timeStr := "(" + formatSecs(r.Elapsed) + ")"
+			fmt.Print("  ")
+			fmt.Print(c.gray(timeStr))
+			fmt.Print(pad(timeWidth - utf8.RuneCountInString(timeStr)))
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", c.status(r.Action), r.Name, timeStr)
+		fmt.Println()
 	}
-	_ = tw.Flush()
 	return
 }
 
-// printBuildErrors renders build and generic errors by package.  Each
-// error line is trimmed and coloured red.  Empty strings are skipped.
-// When runner is true, a corresponding GitHub Actions annotation is
-// emitted for each line. File/line formatted errors are encoded
-// using the annotation syntax "::error file=name,line=n::message"; all
-// other lines use the simpler "::error ::message" form. This allows
-// GitHub to surface the errors inline in the code view while still
-// preserving human‑friendly output.
+// printBuildErrors renders build and generic errors by package. Each
+// error line is trimmed and coloured red. Empty strings are skipped.
 func printBuildErrors(c colors, pkgErrors map[string][]string, runner bool) {
 	if len(pkgErrors) == 0 {
 		return
@@ -337,6 +366,7 @@ func printBuildErrors(c colors, pkgErrors map[string][]string, runner bool) {
 		pkgs = append(pkgs, p)
 	}
 	sort.Strings(pkgs)
+
 	for _, p := range pkgs {
 		fmt.Println(c.bold(p))
 		for _, line := range pkgErrors[p] {
@@ -344,9 +374,7 @@ func printBuildErrors(c colors, pkgErrors map[string][]string, runner bool) {
 			if trimmed == "" {
 				continue
 			}
-			// Print the human readable line
 			fmt.Println("  " + c.red(trimmed))
-			// Emit annotation for GitHub runner if requested
 			if runner {
 				if m := fileLineRe.FindStringSubmatch(trimmed); len(m) == 4 {
 					file, lineNum, msg := m[1], m[2], m[3]
@@ -361,25 +389,42 @@ func printBuildErrors(c colors, pkgErrors map[string][]string, runner bool) {
 }
 
 // printFailures prints a high‑level summary table of failed tests followed by
-// detailed log excerpts.  When showLogs is false only file/line
-// information is displayed for each failure; when true, all output
-// lines are rendered in grey.  When runner is true, the fail lines
-// themselves are also echoed in GitHub Actions annotation format so
-// that the runner can surface them inline.  The human readable
-// output remains unchanged to aid local debugging.
-func printFailures(c colors, failed []*testResult, showLogs bool, runner bool) {
+// detailed log excerpts.
+func printFailures(c colors, failed []*testResult, showLogs, runner bool) {
 	if len(failed) == 0 {
 		return
 	}
+
 	fmt.Println()
 	fmt.Printf("%s\n", c.bold(fmt.Sprintf("=== FAILURES (%d) ===", len(failed))))
-	// Tabular header
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "Package\tTest\tStatus\n")
+
+	// Column widths for summary table
+	pkgWidth, testWidth, statusWidth := 0, 0, 0
 	for _, r := range failed {
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", r.Package, r.Name, c.status(r.Action))
+		if lp := utf8.RuneCountInString(r.Package); lp > pkgWidth {
+			pkgWidth = lp
+		}
+		if lt := utf8.RuneCountInString(r.Name); lt > testWidth {
+			testWidth = lt
+		}
+		sw := visibleLen(c.status(r.Action))
+		if sw > statusWidth {
+			statusWidth = sw
+		}
 	}
-	_ = tw.Flush()
+
+	fmt.Printf("%s", pad(2))
+	fmt.Printf("%-*s  %-*s  %-*s\n", pkgWidth, "Package", testWidth, "Test", statusWidth, "Status")
+	for _, r := range failed {
+		statusStr := c.status(r.Action)
+		fmt.Printf("%s", pad(2))
+		fmt.Printf("%-*s  ", pkgWidth, r.Package)
+		fmt.Printf("%-*s  ", testWidth, r.Name)
+		fmt.Print(statusStr)
+		fmt.Print(pad(statusWidth - visibleLen(statusStr)))
+		fmt.Println()
+	}
+
 	fmt.Println()
 	fmt.Println(c.bold("--- FAIL DETAILS ---"))
 	for _, r := range failed {
@@ -389,25 +434,15 @@ func printFailures(c colors, failed []*testResult, showLogs bool, runner bool) {
 			if trim == "" {
 				continue
 			}
-			// If the line looks like a file:line: message, render a coloured
-			// summary and optionally emit a GitHub annotation. Otherwise
-			// treat it as generic output.
 			if m := fileLineRe.FindStringSubmatch(trim); len(m) == 4 {
 				file, lineNum, msg := m[1], m[2], m[3]
-				// Human friendly formatting
 				fmt.Printf("%s\n", c.style("FAIL at "+file+":"+lineNum, cRed, cBold))
 				fmt.Printf("    %s\n", c.red(strings.TrimSpace(msg)))
-				// Annotation for runner if requested
 				if runner {
 					fmt.Printf("::error file=%s,line=%s::%s\n", file, lineNum, strings.TrimSpace(msg))
 				}
 				continue
 			}
-			// Generic output line.  Only show or annotate these lines when
-			// the caller has asked for logs via --show-logs.  When
-			// showLogs is false we skip both the grey output and
-			// annotations so as not to clutter the GitHub runner output
-			// with implementation details or unrelated log noise.
 			if showLogs {
 				fmt.Println(c.gray(trim))
 				if runner {
@@ -432,23 +467,56 @@ func printSlowest(c colors, timed []*testResult, topN int) {
 	if topN > len(timed) {
 		topN = len(timed)
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tPackage\tTest\tTime")
+
+	indexWidth := len(strconv.Itoa(topN))
+	pkgWidth, testWidth, timeWidth := 0, 0, 0
 	for i, r := range timed[:topN] {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", i+1, r.Package, r.Name, formatSecs(r.Elapsed))
+		if w := len(strconv.Itoa(i + 1)); w > indexWidth {
+			indexWidth = w
+		}
+		if lp := utf8.RuneCountInString(r.Package); lp > pkgWidth {
+			pkgWidth = lp
+		}
+		if lt := utf8.RuneCountInString(r.Name); lt > testWidth {
+			testWidth = lt
+		}
+		tStr := formatSecs(r.Elapsed)
+		if lt := utf8.RuneCountInString(tStr); lt > timeWidth {
+			timeWidth = lt
+		}
 	}
-	_ = tw.Flush()
+
+	fmt.Printf("%-*s  %-*s  %-*s  %-*s\n",
+		indexWidth, "#",
+		pkgWidth, "Package",
+		testWidth, "Test",
+		timeWidth, "Time",
+	)
+	for i, r := range timed[:topN] {
+		fmt.Printf("%-*d  %-*s  %-*s  %-*s\n",
+			indexWidth, i+1,
+			pkgWidth, r.Package,
+			testWidth, r.Name,
+			timeWidth, formatSecs(r.Elapsed),
+		)
+	}
 }
 
+// ===== main ===================================================================
+
 func main() {
-	condense := flag.Bool("condense", false, "condense successful tests to package-level summary")
-	noColor := flag.Bool("no-color", false, "disable coloured output")
+	summary := flag.Bool("summary", false, "condense successful packages to package-level summary")
+	noColors := flag.Bool("no-colors", false, "disable coloured output")
 	topN := flag.Int("top", 10, "number of slowest tests to show")
 	showLogs := flag.Bool("show-logs", false, "include INFO/WARN logs in fail details")
-	runner := flag.Bool("runner", false, "emit GitHub Actions annotations for errors and failures")
+	githubAnnotations := flag.Bool("github", false, "emit GitHub Actions annotations for errors and failures")
 	flag.Parse()
-	colors := newColors(!*noColor)
+
+	colors := newColors(!*noColors)
+	annotate := *githubAnnotations
+
 	agg := NewAggregator(*showLogs)
+
 	dec := json.NewDecoder(bufio.NewReader(os.Stdin))
 	for {
 		var ev Event
@@ -456,51 +524,47 @@ func main() {
 			if err == io.EOF {
 				break
 			}
-			// Use fmt.Fprintf on stderr rather than log to avoid automatically
-			// adding timestamps. Propagate the error by exiting with a
-			// non‑zero status code.
 			fmt.Fprintf(os.Stderr, "decode error: %v\n", err)
 			os.Exit(1)
 		}
 		agg.Add(ev)
 	}
+
 	fmt.Println(colors.bold("=== TEST RESULTS ==="))
+
 	total, passed, failedCount, skipped := 0, 0, 0, 0
-	pkgs := agg.Packages()
-	for _, pkg := range pkgs {
-		// Skip packages that only contain build errors; those will be
-		// rendered separately in printBuildErrors.
-		if _, hasErr := agg.pkgErrors[pkg]; hasErr {
-			continue
-		}
+	for _, pkg := range agg.Packages() {
 		tests := agg.testsByPkg[pkg]
-		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		tTot, tPass, tFail, tSkip := printPackageBlock(colors, pkg, tests, *condense, tw)
+		tTot, tPass, tFail, tSkip := printPackageBlock(colors, pkg, tests, *summary)
 		total += tTot
 		passed += tPass
 		failedCount += tFail
 		skipped += tSkip
 	}
+
 	fmt.Println()
-	printBuildErrors(colors, agg.pkgErrors, *runner)
+	printBuildErrors(colors, agg.pkgErrors, annotate)
+
 	failedTests := agg.Failed()
 	if len(failedTests) > 0 {
 		fmt.Println()
-		printFailures(colors, failedTests, *showLogs, *runner)
+		printFailures(colors, failedTests, *showLogs, annotate)
 	}
+
 	printSlowest(colors, agg.Timed(), *topN)
+
 	fmt.Println()
 	printHeader(colors, "SUMMARY")
-	fmt.Printf("Total: %d, %s%d passed%s, %s%d failed%s, %s%d skipped%s, %s%d build errors%s\n",
+	fmt.Printf(
+		"Total: %d, %s passed, %s failed, %s skipped, %s build errors\n",
 		total,
-		colors.green(""), passed, "",
-		colors.red(""), failedCount, "",
-		colors.yellow(""), skipped, "",
-		colors.red(""), len(agg.pkgErrors), "",
+		colors.green(strconv.Itoa(passed)),
+		colors.red(strconv.Itoa(failedCount)),
+		colors.yellow(strconv.Itoa(skipped)),
+		colors.red(strconv.Itoa(len(agg.pkgErrors))),
 	)
-	// Exit with non‑zero status if any failures or build errors were
-	// encountered. When --runner is specified annotations will have
-	// already been emitted in printFailures and printBuildErrors.
+
+	// Exit non-zero on any failure or build error.
 	if failedCount > 0 || len(agg.pkgErrors) > 0 {
 		os.Exit(1)
 	}
